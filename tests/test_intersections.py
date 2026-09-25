@@ -5,7 +5,18 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.intersections import find_intersections  # noqa: E402
+import app.intersections as intersections_module  # noqa: E402
+from app.intersections import (  # noqa: E402
+    _BBOX_PAD_REL,
+    _adjacent,
+    _candidate_pairs,
+    _classify,
+    _entry,
+    _make_edge,
+    _merge_key,
+    _sort_key,
+    find_intersections,
+)
 from app.svggeo import Contour, analyze_contours  # noqa: E402
 
 
@@ -209,6 +220,234 @@ def test_single_point_closed_subpath():
     _c, res = _find("M5,5 Z")
     assert res["checked_contour_count"] == 1
     assert res["intersections"] == []
+
+
+# ---------------------------------------------------------------------------
+# 包围盒扫掠粗筛：保守外扩不漏报、稀疏减算、候选与暴力枚举等价
+# ---------------------------------------------------------------------------
+
+def _brute_force_intersections(contours):
+    """改造前的双层暴力枚举（i<j 自交 + 轮廓序互交），作为粗筛正确性基准。"""
+    closed = [c for c in contours if c.closed]
+    closed.sort(key=lambda c: c.original_index)
+    merged = {}
+
+    def add(kind, key, coord, idx, edge):
+        item = merged.setdefault(
+            key, {"kind": kind, "coord": coord, "groups": {}})
+        item["groups"].setdefault(idx, set()).add(edge)
+
+    for c in closed:
+        pts, n = c.points, len(c.points)
+        for i in range(n):
+            a, b = pts[i], pts[(i + 1) % n]
+            for j in range(i + 1, n):
+                if j == i + 1 or (i == 0 and j == n - 1):
+                    continue
+                p, q = pts[j], pts[(j + 1) % n]
+                for kind, coord in _classify(a, b, p, q):
+                    key = _merge_key(kind, coord)
+                    add(kind, key, coord, c.original_index, i)
+                    add(kind, key, coord, c.original_index, j)
+    for ai in range(len(closed)):
+        ca = closed[ai]
+        pa, na = ca.points, len(ca.points)
+        for cb in closed[ai + 1:]:
+            pb, nb = cb.points, len(cb.points)
+            for i in range(na):
+                a, b = pa[i], pa[(i + 1) % na]
+                for j in range(nb):
+                    p, q = pb[j], pb[(j + 1) % nb]
+                    for kind, coord in _classify(a, b, p, q):
+                        key = _merge_key(kind, coord)
+                        add(kind, key, coord, ca.original_index, i)
+                        add(kind, key, coord, cb.original_index, j)
+
+    role = {c.original_index: c.role for c in contours}
+    return [_entry(it, role)
+            for it in sorted(merged.values(),
+                             key=lambda it: _sort_key(it, role))]
+
+
+def test_bbox_pad_covers_classification_tolerances():
+    # 每条边的保守外扩量 = _BBOX_PAD_REL × 边长；至少覆盖精判参数域双侧
+    # 越界 2·_EPS_PAR（端点接触）与线域容差 _EPS_LINE（近共线），
+    # 并在角域阈值 _EPS_ANGLE 之外留安全余量吸收舍入
+    from app.intersections import _EPS_ANGLE, _EPS_LINE, _EPS_PAR
+    assert _BBOX_PAD_REL >= 2 * _EPS_PAR + _EPS_LINE + _EPS_ANGLE
+
+
+def test_adjacency_predicate_on_closed_ring():
+    assert _adjacent(0, 1, 4)
+    assert _adjacent(1, 0, 4)
+    assert _adjacent(0, 3, 4)       # 闭合边与首边相邻
+    assert not _adjacent(0, 2, 4)
+    assert not _adjacent(1, 3, 6)
+
+
+def test_near_gap_endpoint_contact_not_dropped_by_broadphase():
+    # 两条横向细矩形仅隔 5e-10（单位尺度）：未外扩的包围盒严格分离，
+    # 但精判在参数/线域容差内会报告端点接触与（端点级）共线关系——
+    # 粗筛保守外扩后必须仍把这些边对交给精判
+    d = ("M0,0 L10,0 L10,1 L0,1 Z "
+         "M10.0000000005,0 L20,0 L20,1 L10.0000000005,1 Z")
+    _c, res = _find(d)
+    by = _by_point(res)
+    # 水平相邻边：端点级接触（两对角点）
+    contact0 = [(g["original_index"], tuple(g["edge_indices"]))
+                for g in by[(10.0, 0.0)]["contours"]]
+    contact1 = [(g["original_index"], tuple(g["edge_indices"]))
+                for g in by[(10.0, 1.0)]["contours"]]
+    assert (0, (0, 1)) in contact0 and (1, (0, 3)) in contact0
+    assert (0, (1, 2)) in contact1 and (1, (2, 3)) in contact1
+    # 两条竖边近共线、纵向区间恰好相触（容差内）：共线/接触由精判决定，
+    # 但该边对绝不能在粗筛被丢弃（清单不得因外扩不足而变短）
+    assert res["intersection_count"] >= 3
+
+    # 对照：间隙 1e-3 远超容差与外扩，包围盒不相交、清单为空
+    _c2, far = _find(
+        "M0,0 L10,0 L10,1 L0,1 Z M10.001,0 L20,0 L20,1 L10.001,1 Z")
+    assert far["intersection_count"] == 0
+
+
+def test_large_scale_near_gap_still_classified():
+    # 边长 1e6、纵向端点间隙 5e-4（< _EPS_PAR·边长=1e-3）：近端点接触在
+    # 大坐标下仍须被粗筛放行（AABB 双侧外扩 2·4e-9·1e6=8e-3 覆盖该间隙）
+    K = 1_000_000
+    d = (f"M0,{K} L{K},{K} L{K},{K+1} L0,{K+1} Z "
+         f"M{K + 0.0005},{K} L{2*K + 0.0005},{K} "
+         f"L{2*K + 0.0005},{K+1} L{K + 0.0005},{K+1} Z")
+    _c, res = _find(d)
+    assert res["intersection_count"] == 2  # 两对角点的端点接触
+    for item in res["intersections"]:
+        assert item["type"] == "endpoint_contact"
+
+
+def test_sparse_path_reduces_precise_classifications(monkeypatch):
+    # 100 个沿网格拉开的 1x1 方块（400 条边，全配对约 8 万对）：
+    # x 扫掠 + y 过滤后无须任何一次精确分类
+    parts = []
+    for r in range(10):
+        for c in range(10):
+            parts.append(f"M{100*r},{100*c}h1v1h-1Z")
+    contours, _ = analyze_contours(" ".join(parts), "nonzero")
+
+    calls = [0]
+    real_classify = intersections_module._classify
+
+    def counting(a, b, c, d):
+        calls[0] += 1
+        return real_classify(a, b, c, d)
+
+    monkeypatch.setattr(intersections_module, "_classify", counting)
+    res = find_intersections(contours)
+    assert res["intersection_count"] == 0
+    assert calls[0] == 0
+
+
+def test_dense_overlap_gives_complete_list(monkeypatch):
+    # 82 个轮廓密集重叠（328 边）：粗筛减算但输出与暴力枚举逐字一致
+    parts = ["M0,0h10v10h-10Z"]
+    for r in range(9):
+        for c in range(9):
+            parts.append(f"M{-1 + 1.2*c},{-1 + 1.2*r}h2v2h-2Z")
+    contours, _ = analyze_contours(" ".join(parts), "nonzero")
+
+    calls = [0]
+    real_classify = intersections_module._classify
+
+    def counting(a, b, c, d):
+        calls[0] += 1
+        return real_classify(a, b, c, d)
+
+    monkeypatch.setattr(intersections_module, "_classify", counting)
+    got = find_intersections(contours)["intersections"]
+    # 328 边全配对 53628 次；粗筛后精确分类显著更少
+    assert calls[0] < 53628 // 10
+    assert got == _brute_force_intersections(contours)
+    assert len(got) > 100  # 完整清单而非空/截断
+
+
+def test_candidate_pairs_match_brute_force_on_random_rings():
+    # 随机闭合环上：扫掠候选对（按 (轮廓, 边) 规范化）恰好等于
+    # “同环非相邻 + 跨环全部”的包围盒相交配对全集
+    import random
+    rng = random.Random(20260925)
+    for _ in range(200):
+        # 生产路径的细分环经 dedupe_ring 去重，随机环同样过滤重复点
+        rings = []
+        for _r in range(rng.randint(1, 4)):
+            pts, seen = [], set()
+            for _ in range(rng.randint(1, 9)):
+                p = (rng.uniform(-5, 5), rng.uniform(-5, 5))
+                if p not in seen:
+                    seen.add(p)
+                    pts.append(p)
+            rings.append(pts)
+        contours = [_contour(i, pts) for i, pts in enumerate(rings)]
+        edges = [_make_edge(ci, pts, k, len(pts))
+                 for ci, pts in enumerate(rings)
+                 for k in range(len(pts))]
+        ring_len = {c.original_index: len(c.points) for c in contours}
+
+        # 扫掠原始候选只保证 AABB 相交（相邻边共享端点必然相交）；
+        # 生产代码在精判前按同环相邻跳过，这里同口径过滤后比较
+        got = set()
+        for a, b in _candidate_pairs(edges):
+            if (a.contour_idx == b.contour_idx
+                    and _adjacent(a.edge, b.edge,
+                                  ring_len[a.contour_idx])):
+                continue
+            got.add(_pair_key(a, b))
+        assert got == _brute_candidate_set(contours)
+
+
+def _pair_key(a, b):
+    k1, k2 = (a.contour_idx, a.edge), (b.contour_idx, b.edge)
+    return tuple(sorted((k1, k2)))
+
+
+def _brute_candidate_set(contours):
+    """未扫掠的直接包围盒配对基准（同环非相邻 + 跨环全部）。"""
+    edges = [_make_edge(c.original_index, c.points, k, len(c.points))
+             for c in contours for k in range(len(c.points))]
+    pairs = set()
+    for x, e in enumerate(edges):
+        for f in edges[:x]:
+            if (e.contour_idx == f.contour_idx
+                    and _adjacent(e.edge, f.edge,
+                                  _ring_size(contours, e.contour_idx))):
+                continue
+            if (e.x0 <= f.x1 and f.x0 <= e.x1
+                    and e.y0 <= f.y1 and f.y0 <= e.y1):
+                pairs.add(_pair_key(e, f))
+    return pairs
+
+
+def _ring_size(contours, original_index):
+    for c in contours:
+        if c.original_index == original_index:
+            return len(c.points)
+    raise KeyError(original_index)
+
+
+def test_broadphase_equals_brute_force_on_random_contours():
+    # 端到端：随机轮廓（含极小/大尺度与远离原点平移）下，扫掠结果与
+    # 改造前暴力枚举的完整清单逐字一致（类型、坐标、边索引、次序）
+    import random
+    rng = random.Random(777)
+    for _trial in range(300):
+        contours = []
+        for ci in range(rng.randint(1, 4)):
+            n = rng.randint(1, 10)
+            scale = rng.choice([1.0, 1e-6, 1e3, 1e9])
+            tx = rng.choice([0.0, 1e6, -1e9, 1e12])
+            pts = [(round(rng.uniform(-5, 5) * scale + tx, 6),
+                    round(rng.uniform(-5, 5) * scale + tx, 6))
+                   for _ in range(n)]
+            contours.append(_contour(ci, pts))
+        assert (find_intersections(contours)["intersections"]
+                == _brute_force_intersections(contours))
 
 
 def test_curves_flattened_before_intersection():

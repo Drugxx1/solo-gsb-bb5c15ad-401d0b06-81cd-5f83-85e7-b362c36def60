@@ -8,6 +8,22 @@
   属正常连接，跳过；闭合环含末点回首点的闭合边）；
 - **互交**：不同闭合子路径之间的全部边对。
 
+边对搜索分两层（粗筛 + 精判）：
+
+- **粗筛（包围盒扫掠）**：对每条细分边建立**轴对齐包围盒（AABB）**，
+  按 x 区间做事件扫掠（边的 xmin/xmax 处进入/退出活动集），仅对
+  y 区间也重叠的活动边对做进一步检查——稀疏大路径的精确分类次数可由
+  边数平方降到接近线性；
+- **精判（现有相交分类）**：粗筛候选仍交给:func:`_classify` 做
+  crossing / endpoint_contact / collinear_overlap 三类判定，密集重叠时
+  所有包围盒相交的边对都会被枚举，清单完整不漏。
+
+包围盒按 :data:`_BBOX_PAD_REL` × 边长**保守外扩**：精判所用的参数域
+端点容差（:data:`_EPS_PAR`）、角域与线域相对容差（:data:`_EPS_ANGLE` /
+:data:`_EPS_LINE`）都可能把**包围盒本不相交**的边对判成交点（近端点
+接触、近共线重叠），外扩量取这些容差并留出安全余量，保证粗筛只可能
+多报候选、绝不漏掉精判会报告的边对。
+
 开放轮廓（未以 ``Z`` 闭合）不参与（列入 ``skipped_contours``）；
 闭合但退化的子路径（面积为 0 或顶点不足）仍按字面意义参与边检查。
 
@@ -28,7 +44,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from bisect import bisect_left, insort
+from typing import Any, NamedTuple
 
 from .svggeo import Contour
 
@@ -39,6 +56,14 @@ _EPS_ANGLE = 1e-9
 # 线域（无量纲）相对容差：判共线/点落边时的垂直距离阈值 = 该值 ×
 # 对应长度基准（共线取较短边、点落边取被落边）
 _EPS_LINE = 1e-9
+# 包围盒保守外扩（无量纲相对值）：每条边的 AABB 各轴外扩 该值 × 边长。
+# 粗筛必须覆盖精判容差所能接受的“最近距离”：
+#   非平行分支 |t|,|s| 可放宽到 _EPS_PAR，两端点越界合计 ≤ 2·_EPS_PAR·长边；
+#   平行/共线分支垂直间距 ≤ _EPS_LINE·较短边，纵向参数越界 ≤ _EPS_PAR·长边；
+# 角域阈值 _EPS_ANGLE 另带来 O(_EPS_ANGLE) 量级的投影偏移。取 4e-9 >
+# 2·_EPS_PAR + _EPS_LINE + _EPS_ANGLE = 3e-9（含 1e-9 余量吸收浮点舍入），
+# 使近端点接触 / 近共线重叠等包围盒本不相交的边对不被粗筛漏掉。
+_BBOX_PAD_REL = 4e-9
 # 输出量化位数（仅影响 JSON 展示，不改变判定与合并键）
 _DECIMALS = 9
 
@@ -82,34 +107,50 @@ def find_intersections(contours: list[Contour]) -> dict[str, Any]:
             merged[key] = item
         item["groups"].setdefault(contour_idx, set()).add(edge)
 
-    # ---- 环内自交：非相邻边对 --------------------------------------------
-    for c in closed:
-        pts, n = c.points, len(c.points)
-        for i in range(n):
-            a, b = pts[i], pts[(i + 1) % n]
-            for j in range(i + 1, n):
-                if j == i + 1 or (i == 0 and j == n - 1):
-                    continue  # 相邻边仅共享端点，属正常连接
-                p, q = pts[j], pts[(j + 1) % n]
-                for kind, coord in _classify(a, b, p, q):
-                    key = _merge_key(kind, coord)
-                    add(kind, key, coord, c.original_index, i)
-                    add(kind, key, coord, c.original_index, j)
+    def classify_pair(e1: _Edge, e2: _Edge) -> None:
+        """粗筛候选交精判；同环非相邻边 / 跨环全部候选均在此分类。
 
-    # ---- 不同闭合子路径之间：全部边对 ------------------------------------
-    for ai in range(len(closed)):
-        ca = closed[ai]
-        pa, na = ca.points, len(ca.points)
-        for cb in closed[ai + 1:]:
-            pb, nb = cb.points, len(cb.points)
-            for i in range(na):
-                a, b = pa[i], pa[(i + 1) % na]
-                for j in range(nb):
-                    p, q = pb[j], pb[(j + 1) % nb]
-                    for kind, coord in _classify(a, b, p, q):
-                        key = _merge_key(kind, coord)
-                        add(kind, key, coord, ca.original_index, i)
-                        add(kind, key, coord, cb.original_index, j)
+        调用方已按旧遍历次序（自交 (轮廓, i<j)；互交 (小轮廓, 大轮廓, i,
+        j)）规范化参数顺序——精判在其首条边上插值交点，固定次序可保证
+        大坐标下输出坐标逐位一致。
+        """
+        for kind, coord in _classify(e1.a, e1.b, e2.a, e2.b):
+            key = _merge_key(kind, coord)
+            add(kind, key, coord, e1.contour_idx, e1.edge)
+            add(kind, key, coord, e2.contour_idx, e2.edge)
+
+    # 粗筛：全部闭合环的细分边统一做 AABB x 扫掠 + y 区间过滤；
+    # 同环仅保留非相邻边对，跨环候选全部交给精判。
+    edges: list[_Edge] = []
+    ring_sizes: dict[int, int] = {}
+    for c in closed:
+        n = len(c.points)
+        ring_sizes[c.original_index] = n
+        for k in range(n):
+            edges.append(_make_edge(c.original_index, c.points, k, n))
+
+    # 候选按旧遍历次序（环内自交在前：(轮廓, i<j)；跨环互交在后：
+    # (较小轮廓, 较大轮廓, i, j)）排序后再精判——合并条目的代表坐标取
+    # 首次插入该合并键的边对插值结果，固定次序可保证大坐标下输出与
+    # 逐位一致（同一点由不同边对插值可有 ULP 级差异）。
+    ordered: list[tuple[tuple, _Edge, _Edge]] = []
+    for ea, eb in _candidate_pairs(edges):
+        if ea.contour_idx == eb.contour_idx:
+            if _adjacent(ea.edge, eb.edge,
+                         ring_sizes[ea.contour_idx]):
+                continue  # 相邻边仅共享端点，属正常连接
+            e1, e2 = ((ea, eb) if ea.edge < eb.edge else (eb, ea))
+            order = (0, e1.contour_idx, e1.edge, e2.edge)
+        else:
+            e1, e2 = ((ea, eb) if ea.contour_idx < eb.contour_idx
+                      else (eb, ea))
+            order = (1, e1.contour_idx, e2.contour_idx,
+                     e1.edge, e2.edge)
+        ordered.append((order, e1, e2))
+    ordered.sort(key=lambda t: t[0])
+
+    for _order, e1, e2 in ordered:
+        classify_pair(e1, e2)
 
     role_by_index = {c.original_index: c.role for c in contours}
     intersections = [
@@ -124,6 +165,69 @@ def find_intersections(contours: list[Contour]) -> dict[str, Any]:
         "intersections": intersections,
         "skipped_contours": skipped,
     }
+
+
+# ---------------------------------------------------------------------------
+# 粗筛：边包围盒（AABB）x 扫掠 + y 区间过滤
+# ---------------------------------------------------------------------------
+
+class _Edge(NamedTuple):
+    contour_idx: int          # 所属轮廓的 original_index
+    edge: int                 # 边索引（points[edge] -> points[(edge+1) mod n]）
+    a: tuple[float, float]
+    b: tuple[float, float]
+    x0: float                 # 外扩后包围盒
+    y0: float
+    x1: float
+    y1: float
+
+
+def _make_edge(contour_idx: int,
+               pts: list[tuple[float, float]],
+               k: int, n: int) -> _Edge:
+    """细分边 k 的保守 AABB：各轴按 :data:`_BBOX_PAD_REL` × 边长外扩。"""
+    a, b = pts[k], pts[(k + 1) % n]
+    ax, ay = a
+    bx, by = b
+    minx, maxx = (ax, bx) if ax <= bx else (bx, ax)
+    miny, maxy = (ay, by) if ay <= by else (by, ay)
+    pad = _BBOX_PAD_REL * math.hypot(bx - ax, by - ay)
+    return _Edge(contour_idx, k, a, b,
+                 minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+
+def _adjacent(i: int, j: int, n: int) -> bool:
+    """同一闭合环上的边 i、j 是否相邻（共享一个细分顶点）。"""
+    return (i - j) % n == 1 or (j - i) % n == 1
+
+
+def _candidate_pairs(edges: list[_Edge]):
+    """枚举外扩 AABB 相交的边对。
+
+    x 轴事件扫掠：每条边在 x0 处进入活动集、x1 处退出（同一 x 先进后出，
+    使仅在端点相切的包围盒也同处活动集）；进入时仅与活动集中 **y 区间
+    重叠** 的边配对，因此候选对的 x、y 区间均相交（含边界）。
+    """
+    # (x, kind, edge_index)：kind 0=进入、1=退出；进入先于退出（同一 x
+    # 时进入事件在前），使仅在端点相切的包围盒也同处活动集；edge_index
+    # 唯一且单调，顺序确定。
+    events = [(e.x0, 0, idx) for idx, e in enumerate(edges)]
+    events += [(e.x1, 1, idx) for idx, e in enumerate(edges)]
+    events.sort()
+
+    # 活动集按 (y0, 边序号) 排序；y1 仅用于区间重叠判断
+    active: list[tuple[float, int]] = []
+    for _x, kind, idx in events:
+        e = edges[idx]
+        if kind == 1:
+            active.pop(bisect_left(active, (e.y0, idx)))
+            continue
+        # y0_other <= e.y1 的活动边才可能 y 区间重叠
+        stop = bisect_left(active, (e.y1, math.inf))
+        for _y0, other in active[:stop]:
+            if edges[other].y1 >= e.y0:  # 另一侧 y 区间须搭接到 e.y0
+                yield edges[other], e
+        insort(active, (e.y0, idx))
 
 
 # ---------------------------------------------------------------------------
