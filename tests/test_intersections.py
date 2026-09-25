@@ -428,3 +428,191 @@ def _contour(idx, pts, role="outer"):
         role=role,
         depth=0,
     )
+
+
+# ---------------------------------------------------------------------------
+# 宽相（AABB 扫掠）：候选集剪枝与容差保守性
+# ---------------------------------------------------------------------------
+
+def _bowtie_grid_d(m, spacing=6):
+    """m×m 个彼此远离的蝴蝶结小闭合路径（每个内部含 1 个自交）。
+
+    方块宽 1、中心间距 spacing（默认 6）：不同路径的边包围盒相距甚远，
+    宽相应完全不产生跨环候选；每个蝴蝶结的 4 条边有 2 对非相邻边。
+    """
+    parts = []
+    for i in range(m):
+        for j in range(m):
+            x, y = i * spacing, j * spacing
+            parts.append(f"M{x},{y} L{x+1},{y+1} L{x+1},{y} L{x},{y+1} Z")
+    return " ".join(parts)
+
+
+def test_sparse_large_path_prunes_exact_classifications(monkeypatch):
+    # 稀疏大路径：15×15 个远离的蝴蝶结。全枚举需检查约
+    # 环内 2·225 + 跨环 16·16·C(225,2) ≈ 1.28e6 个边对；宽相后跨环候选
+    # 必须为 0，每个蝴蝶结 4 条边的 2 对非相邻边中只有边 0/2 包围盒相交，
+    # 故精确分类恰为每环 1 次 = 225 次，且 225 个自交一个不漏。
+    m = 15
+    contours, _ = analyze_contours(_bowtie_grid_d(m), "nonzero")
+
+    calls = {"n": 0}
+    from app import intersections as mod
+    orig_classify = mod._classify
+
+    def counting(a, b, c, d):
+        calls["n"] += 1
+        return orig_classify(a, b, c, d)
+
+    monkeypatch.setattr(mod, "_classify", counting)
+    res = find_intersections(contours)
+
+    assert calls["n"] == m * m                # 每环仅 1 对候选，跨环 0 次
+    assert res["intersection_count"] == m * m
+    assert all(it["type"] == "crossing"
+               for it in res["intersections"])
+
+
+def test_dense_overlap_still_gives_full_list(monkeypatch):
+    # 密集重叠：多条近重合的闭合方块，宽相必须把全部相交边对交给精确
+    # 分类，清单与“全枚举候选”参考实现逐条一致（类型/坐标/边索引）。
+    import random
+    rng = random.Random(2024)
+    parts = []
+    for _ in range(8):
+        dx, dy = rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5)
+        parts.append(f"M{dx},{dy} L40,{dy} L{40+dx},40 L{dx},40 Z")
+    # 再加一对共线重叠，保证三类都出现
+    parts.append("M10,-20 L30,-20 L30,0 L10,0 Z")
+    contours, _ = analyze_contours(" ".join(parts), "nonzero")
+
+    def brute(contours):
+        """全枚举边对（同环跳过相邻）+ 与生产相同的合并/排序。"""
+        from app import intersections as mod
+        closed = sorted([c for c in contours if c.closed],
+                        key=lambda c: c.original_index)
+        merged = {}
+
+        def add(kind, key, coord, idx, edge):
+            item = merged.get(key)
+            if item is None:
+                item = {"kind": kind, "coord": coord,
+                        "groups": {idx: set()}}
+                merged[key] = item
+            item["groups"].setdefault(idx, set()).add(edge)
+
+        for c in closed:
+            pts, n = c.points, len(c.points)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if (i + 1) % n == j or (j + 1) % n == i:
+                        continue
+                    for kind, coord in mod._classify(
+                            pts[i], pts[(i + 1) % n],
+                            pts[j], pts[(j + 1) % n]):
+                        key = mod._merge_key(kind, coord)
+                        add(kind, key, coord, c.original_index, i)
+                        add(kind, key, coord, c.original_index, j)
+        for ai in range(len(closed)):
+            ca, pa = closed[ai], closed[ai].points
+            na = len(pa)
+            for cb in closed[ai + 1:]:
+                pb, nb = cb.points, len(cb.points)
+                for i in range(na):
+                    for j in range(nb):
+                        for kind, coord in mod._classify(
+                                pa[i], pa[(i + 1) % na],
+                                pb[j], pb[(j + 1) % nb]):
+                            key = mod._merge_key(kind, coord)
+                            add(kind, key, coord, ca.original_index, i)
+                            add(kind, key, coord, cb.original_index, j)
+        role = {c.original_index: c.role for c in contours}
+        return [mod._entry(item, role)
+                for item in sorted(merged.values(),
+                                   key=lambda it: mod._sort_key(it, role))]
+
+    sweep = find_intersections(contours)["intersections"]
+    expected = brute(contours)
+
+    def sig(items):
+        out = []
+        for it in items:
+            groups = tuple(sorted(
+                (g["original_index"], tuple(g["edge_indices"]))
+                for g in it["contours"]))
+            coord = tuple((p["x"], p["y"])
+                          for p in (it.get("points") or [it["point"]]))
+            out.append((it["type"], groups, coord))
+        return sorted(out, key=lambda z: (z[0], z[1]))
+
+    a, b = sig(sweep), sig(expected)
+    assert len(a) == len(b)
+    for (ka, ga, pa_), (kb, gb, pb_) in zip(a, b):
+        assert ka == kb and ga == gb
+        # 不同边对枚举次序下插值坐标可能差亚 ULP，按相对精度比较
+        for (x1, y1), (x2, y2) in zip(pa_, pb_):
+            m = max(1.0, abs(x1), abs(y1), abs(x2), abs(y2))
+            assert abs(x1 - x2) <= 1e-9 * m
+            assert abs(y1 - y2) <= 1e-9 * m
+
+
+def test_sweep_candidates_equal_padded_box_overlap():
+    # 扫掠候选集必须与“所有外扩盒两两重叠（去同环相邻）”集合完全一致：
+    # 不许多（多余候选只是多算，仍要求算法精确）、不许少（少即漏报）。
+    import random
+    from app import intersections as mod
+    rng = random.Random(77)
+    for _ in range(100):
+        contours = []
+        for idx in range(rng.randint(1, 4)):
+            nv = rng.randint(1, 8)
+            pts = [(rng.uniform(-5, 5), rng.uniform(-5, 5))
+                   for _ in range(nv)]
+            contours.append(_contour(idx, pts))
+        edges = mod._build_edges(contours)
+        want = set()
+        for x in range(len(edges)):
+            for y in range(x + 1, len(edges)):
+                r, s = edges[x], edges[y]
+                if mod._adjacent(r, s):
+                    continue
+                if not (r.xmax < s.xmin or s.xmax < r.xmin
+                        or r.ymax < s.ymin or s.ymax < r.ymin):
+                    want.add(frozenset((x, y)))
+        got = set()
+        for r, s in mod._sweep_pairs(edges):
+            got.add(frozenset((edges.index(r), edges.index(s))))
+        assert got == want
+
+
+def test_near_endpoint_contact_within_tolerance_not_pruned():
+    # 近平行的两条长边，端点沿对方方向相差约 _EPS_PAR·L、垂直相差
+    # 约 _EPS_LINE·L：_classify 报 endpoint_contact，宽相外扩必须放行。
+    # 若包围盒不外扩，纵向 ~1e-3 的间隙就会把该边对裁掉而漏报。
+    d = ("M0,0 L1000000,0 L1000000,2 L0,2 Z "
+         "M0,-5e-10 L500000,-5e-10 L500000,-10 L0,-10 Z")
+    _c, res = _find(d)
+    assert any(it["type"] == "endpoint_contact"
+               for it in res["intersections"])
+
+
+def test_near_collinear_overlap_with_normal_gap_not_pruned():
+    # 两长边共线容差内（垂直间隙 5e-10 < _EPS_LINE·短边=1e-9·60）重叠：
+    # 不外扩包围盒会因 y 方向间隙漏掉 collinear_overlap。
+    d = ("M0,0 L100,0 L100,2 L0,2 Z "
+         "M20,5e-10 L80,5e-10 L80,20 L20,20 Z")
+    _c, res = _find(d)
+    assert any(it["type"] == "collinear_overlap"
+               for it in res["intersections"])
+
+
+def test_nonparallel_near_endpoint_contact_not_pruned():
+    # 非平行边在端点外约 _EPS_PAR·L 处穿过（理论参数 1+5e-10）：
+    # 报 endpoint_contact；x 方向原始包围盒间隙 ~5e-4，靠外扩保留候选。
+    L = 1_000_000
+    d = (f"M0,0 L{L},0 L{L},2 L0,2 Z "
+         f"M{L+0.0005},-1 L{L+1.0005},-1 L{L+1.0005},1 "
+         f"L{L+0.0005},1 Z")
+    _c, res = _find(d)
+    assert any(it["type"] == "endpoint_contact"
+               for it in res["intersections"])
